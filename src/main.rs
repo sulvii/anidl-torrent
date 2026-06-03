@@ -3,24 +3,30 @@ mod providers;
 
 use anyhow::Result;
 use http::client::HttpClient;
-use providers::anidb::{anidb_search, get_episodes};
+use providers::animetosho::get_torrents;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let client = HttpClient::new()?;
 
-    let episodes = get_episodes(&client, 18209).await?;
-    for ep in &episodes {
+    let releases = get_torrents(&client, 310799).await?;
+    for r in &releases {
         println!(
-            "{:<4} [{:<22}] {:>4} {:#?}  {}  {}",
-            ep.number,
-            ep.ep_type,
-            ep.duration.as_deref().unwrap_or("—"),
-            ep.id,
-            ep.air_date.as_deref().unwrap_or("—"),
-            ep.title,
+            "[{}] {:>6}↑/{:<6}↓  {}",
+            r.id,
+            r.seeders
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into()),
+            r.leechers
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into()),
+            r.title,
         );
+        for ddl in &r.ddl_links {
+            println!("      {:12}  {}", ddl.provider, ddl.url);
+        }
     }
-    println!("\n{} episodes", episodes.len());
+    println!("\n{} releases", releases.len());
+
     Ok(())
 }

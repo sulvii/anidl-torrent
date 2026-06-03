@@ -1,0 +1,180 @@
+use crate::http::client::HttpClient;
+use anyhow::{Context, Result};
+use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize};
+
+const BASE_URL: &str = "https://animetosho.xyz";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentRelease {
+    pub id: u32,
+    pub title: String,
+    pub url: String,
+    pub torrent_url: Option<String>,
+    pub magnet_url: Option<String>,
+    pub nzb_url: Option<String>,
+    pub seeders: Option<u32>,
+    pub leechers: Option<u32>,
+    pub size_bytes: Option<u64>,
+    pub ddl_links: Vec<DdlLink>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdlLink {
+    pub provider: String,
+    pub url: String,
+}
+
+pub async fn get_torrents(client: &HttpClient, episode_id: u32) -> Result<Vec<TorrentRelease>> {
+    let url = format!("{BASE_URL}/episode/{episode_id}");
+    let html = client
+        .inner
+        .get(&url)
+        .send()
+        .await
+        .context("request failed")?
+        .error_for_status()
+        .context("bad status")?
+        .text()
+        .await
+        .context("body read failed")?;
+
+    parse_torrents(&html)
+}
+
+fn parse_torrents(html: &str) -> Result<Vec<TorrentRelease>> {
+    let document = Html::parse_document(html);
+
+    let entry_sel = Selector::parse("div.home_list_entry").unwrap();
+    let title_sel = Selector::parse("div.link a").unwrap();
+    let size_sel = Selector::parse("div.size").unwrap();
+    let torrent_sel = Selector::parse("div.links a.dllink").unwrap();
+    let magnet_sel = Selector::parse("div.links a[href^='magnet:']").unwrap();
+    let nzb_sel = Selector::parse("div.links a[href$='.nzb.gz']").unwrap();
+    let peers_sel = Selector::parse("div.links span[title]").unwrap();
+    let ddl_sel =
+        Selector::parse("div.links a:not(.dllink):not([href^='magnet:']):not([href$='.nzb.gz'])")
+            .unwrap();
+
+    let mut releases = Vec::new();
+
+    for entry in document.select(&entry_sel) {
+        let Some(title_anchor) = entry.select(&title_sel).next() else {
+            continue;
+        };
+        let title = title_anchor
+            .value()
+            .attr("title")
+            .unwrap_or_else(|| {
+                title_anchor
+                    .text()
+                    .collect::<String>()
+                    .trim()
+                    .to_owned()
+                    .leak()
+            })
+            .to_owned();
+
+        let href = title_anchor.value().attr("href").unwrap_or_default();
+        let url = if href.starts_with("http") {
+            href.to_owned()
+        } else {
+            format!("{BASE_URL}{href}")
+        };
+
+        let id: u32 = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let size_bytes: Option<u64> = entry
+            .select(&size_sel)
+            .next()
+            .and_then(|el| el.value().attr("title"))
+            .and_then(|t| t.split_whitespace().nth(3))
+            .and_then(|s| s.parse().ok());
+
+        let torrent_url = entry
+            .select(&torrent_sel)
+            .next()
+            .and_then(|a| a.value().attr("href"))
+            .map(|h| {
+                if h.starts_with("http") {
+                    h.to_owned()
+                } else {
+                    format!("{BASE_URL}{h}")
+                }
+            });
+
+        let magnet_url = entry
+            .select(&magnet_sel)
+            .next()
+            .and_then(|a| a.value().attr("href"))
+            .map(str::to_owned);
+
+        let nzb_url = entry
+            .select(&nzb_sel)
+            .next()
+            .and_then(|a| a.value().attr("href"))
+            .map(|h| {
+                if h.starts_with("http") {
+                    h.to_owned()
+                } else {
+                    format!("{BASE_URL}{h}")
+                }
+            });
+
+        let (seeders, leechers) = entry
+            .select(&peers_sel)
+            .find_map(|el| {
+                let t = el.value().attr("title")?;
+                parse_peers(t)
+            })
+            .unwrap_or((None, None));
+
+        let ddl_links: Vec<DdlLink> = entry
+            .select(&ddl_sel)
+            .filter_map(|a| {
+                let href = a.value().attr("href")?;
+                if href.starts_with('/') {
+                    return None;
+                }
+                let label = a.text().collect::<String>().trim().to_owned();
+                if label.is_empty() {
+                    return None;
+                }
+                Some(DdlLink {
+                    provider: label,
+                    url: href.to_owned(),
+                })
+            })
+            .collect();
+
+        releases.push(TorrentRelease {
+            id,
+            title,
+            url,
+            torrent_url,
+            magnet_url,
+            nzb_url,
+            seeders,
+            leechers,
+            size_bytes,
+            ddl_links,
+        });
+    }
+
+    Ok(releases)
+}
+
+fn parse_peers(title: &str) -> Option<(Option<u32>, Option<u32>)> {
+    if !title.contains("Seeders") {
+        return None;
+    }
+    let mut parts = title.splitn(2, '/');
+    let seeders = parts.next()?.split_whitespace().nth(1)?.parse().ok();
+    let leechers = parts.next()?.split_whitespace().nth(1)?.parse().ok();
+    Some((seeders, leechers))
+}
